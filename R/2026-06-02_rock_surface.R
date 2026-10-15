@@ -15,6 +15,8 @@ clip_radius <- 20     # m
 dtm_res     <- 0.10   # m
 alpha = 0.5
 
+render <- FALSE
+
 # --------------------
 # read LAS
 # --------------------
@@ -49,7 +51,9 @@ scene20@data <- scene20@data[is.na(scene20@data$is_rock),]
 # ground detection
 scene20 <- classify_ground(scene20, csf(class_threshold = 0.05, sloop_smooth = TRUE))
 ground  <- filter_poi(scene20, Classification == 2)
-plot(ground)
+
+if(render) plot(ground)
+
 if (is.empty(ground)) stop("No ground points found in clipped scene.")
 
 # local ground surface from CSF ground points
@@ -71,12 +75,12 @@ rock_closed <- data.frame(X = as.numeric(c(rock@data$X, dtm_points$x)) - min(roc
                           Y = as.numeric(c(rock@data$Y, dtm_points$y)) - min(rock@data$Y),
                           Z = as.numeric(c(rock@data$Z, dtm_points$Z)) - min(rock@data$Z))
 
-plot(LAS(rock_closed))
+if(render) plot(LAS(rock_closed))
 
 # generate alpha shpape
 ashape_rock <- alphashape3d::ashape3d(as.matrix(rock_closed), alpha = alpha, pert = T)
 
-plot(ashape_rock)
+if(render) plot(ashape_rock)
 
 rock_volume <- alphashape3d::volume_ashape3d(ashape_rock)
 
@@ -85,8 +89,10 @@ ashape_rock_open <- ashape_rock
 ashape_rock_open$triang <- ashape_rock_open$triang[apply(cbind(ashape_rock_open$triang[,"tr1"] < (nrow(rock@data)+1),
                                                      ashape_rock_open$triang[,"tr2"] < (nrow(rock@data)+1),
                                                      ashape_rock_open$triang[,"tr3"] < (nrow(rock@data)+1)), 1, sum) > 2 & (ashape_rock_open$triang[,9] == 2),]
-plot(ashape_rock_open)
-rgl::points3d(rock@data$X - min(rock@data$X), rock@data$Y - min(rock@data$Y), rock@data$Z  - min(rock@data$Z), col = "blue")
+if(render) {
+  plot(ashape_rock_open)
+  rgl::points3d(rock@data$X - min(rock@data$X), rock@data$Y - min(rock@data$Y), rock@data$Z  - min(rock@data$Z), col = "blue")
+}
 
 sn <- alphashape3d::surfaceNormals(ashape_rock_open)
 rock_surface <- sum(sqrt(rowSums(sn$normals^2)))
@@ -98,4 +104,53 @@ rock_normal_variance <- 1 - sqrt(sum(normal_mean^2))
 
 c(A = rock_surface, V = rock_volume, surface_var = rock_normal_variance)
 
+
+# --------------------
+# solar potential of the alpha shape
+# --------------------
+library(oce)
+
+# position of the rock from the LAS CRS
+las_header <- rlas::read.lasheader(rock_file)
+wkt <- las_header$`Variable Length Records`$`WKT OGC CS`$`WKT OGC COORDINATE SYSTEM`
+crs_rock <- sf::st_crs(wkt)   # WGS84 / UTM zone 32N, EPSG 32632
+
+rock_pt <- sf::st_sfc(sf::st_point(c(cx, cy)), crs = crs_rock) |>
+  sf::st_transform(4326)
+lon <- sf::st_coordinates(rock_pt)[, "X"]
+lat <- sf::st_coordinates(rock_pt)[, "Y"]
+
+source("R/rock_radiation.R")
+tz <- "Europe/Berlin"
+veg_start <- as.POSIXct("2025-04-01 00:00:00", tz = tz)
+veg_end <- as.POSIXct("2025-11-01 00:00:00", tz = tz)
+dwd_hourly_2025 <- read_dwd_radiation(station_id = 1346L, max_gap_hours = 3L)
+# Select whole DWD true-solar-hour intervals by their midpoint.
+dwd_vegetation <- dwd_hourly_2025[
+  as.numeric(dwd_hourly_2025$interval_mid_utc) >= as.numeric(veg_start) &
+    as.numeric(dwd_hourly_2025$interval_mid_utc) < as.numeric(veg_end), ]
+
+# triangle areas and unit normals (surfaceNormals returns
+# area-weighted normals, hence the area sum above)
+sn <- alphashape3d::surfaceNormals(ashape_rock_open)
+w <- sqrt(rowSums(sn$normals^2))
+n_unit <- sn$normals / w
+
+# per-triangle outward orientation: flip normals pointing toward the rock
+# centroid (ashape3d triangle winding is not consistently outward)
+tri_idx <- ashape_rock_open$triang[, c("tr1", "tr2", "tr3"), drop = FALSE]
+# Use the actual alpha-shape coordinates, including any perturbation.
+verts <- ashape_rock_open$x
+stopifnot(nrow(tri_idx) == nrow(n_unit), all(is.finite(w)), all(w > 0))
+tri_centr <- (verts[tri_idx[, 1], ] + verts[tri_idx[, 2], ] + verts[tri_idx[, 3], ]) / 3
+out_vec <- tri_centr - matrix(colMeans(verts), nrow(tri_centr), 3, byrow = TRUE)
+flip <- rowSums(n_unit * out_vec) < 0
+n_unit[flip, ] <- -n_unit[flip, ]
+
+radiation_tri <- mesh_radiation(n_unit, dwd_vegetation, lon, lat)
+radiation_summary <- radiation_area_summary(radiation_tri, w)
+radiation_summary
+
+# type may be "direct", "diffuse", or "both" (their sum).
+plot_rock_radiation(verts, tri_idx, radiation_tri, type = "both")
 
